@@ -2,19 +2,22 @@ import React, { useEffect, useMemo, useState } from "react";
 import { ethers } from "ethers";
 
 /**
- * BRS DApp — 单文件 React 组件（MetaMask 连接修复版）
+ * BRS DApp（BTD/BTB）— React 单文件组件（修复版）
  *
- * 修复点（针对 “Failed to connect to MetaMask” ）
- *  - 更稳健的注入检测：支持 window.ethereum.providers，优先选择 isMetaMask 的 provider
- *  - 统一在连接时 try/catch，并给出更友好的错误信息（用户拒绝/无注入/iframe 环境）
- *  - 读写分离（provider / signer），所有写操作先 estimateGas，便于弹出签名框
- *  - 提供“在新窗口打开”按钮以规避 iframe 阻止注入的问题
- *  - 自检用例新增：注入检测、isMetaMask、iframe 检测
+ * 修复错误：
+ * - 之前把完整 HTML 放进了 code/react 文档，构建器按 JS 解析，导致 `SyntaxError: /: Unexpected token (1:0)`。
+ * - 现改回纯 React 组件 + ESM import，确保在 React 项目中可直接编译运行。
  *
- * 现有测试用例保持不变，并**新增**连接相关自检；如果你的预期行为不同，请在聊天里告诉我。
+ * 功能：
+ *  1) 连接钱包（MetaMask 优先，多 provider 兼容）
+ *  2) Mint / Burn BTD；Burn BTB
+ *  3) 对 BTD、BTB 执行 rebase（若 ABI 提供）
+ *  4) 设置 BTC 价格、BTB 价格、年化利率（Config 合约）
+ *  5) Approve（将 BTD/BTB 授权给 Mint 合约）
+ *  6) 内置“自检用例”（Sanity Tests），定位注入/ABI/读链问题
  */
 
-/** 默认合约地址（如与你的部署不一致，可在界面中修改） */
+// ==== 可按需修改的默认地址（也可在界面中覆盖） ====
 const DEFAULT_ADDR = {
   BTD: "0x15Ff979f693c4a4216C4Eb6214c0f9A47990168a",
   BTB: "0x3257E2aA1f2749c4b7B1C4c8D72909C102399925",
@@ -22,7 +25,7 @@ const DEFAULT_ADDR = {
   CONFIG: "0xd817fC345C2fE5e8726fE1b4eA4071139D12C8B4",
 };
 
-/** 最小 ERC20 片段（余额/授权/转账/小数位） */
+// ==== 最小 ERC20 片段（余额/授权/小数位） ====
 const ERC20_MIN_ABI = [
   { type: "function", name: "name", stateMutability: "view", inputs: [], outputs: [{ type: "string" }] },
   { type: "function", name: "symbol", stateMutability: "view", inputs: [], outputs: [{ type: "string" }] },
@@ -30,11 +33,9 @@ const ERC20_MIN_ABI = [
   { type: "function", name: "balanceOf", stateMutability: "view", inputs: [{ name: "owner", type: "address" }], outputs: [{ type: "uint256" }] },
   { type: "function", name: "allowance", stateMutability: "view", inputs: [{ name: "owner", type: "address" }, { name: "spender", type: "address" }], outputs: [{ type: "uint256" }] },
   { type: "function", name: "approve", stateMutability: "nonpayable", inputs: [{ name: "spender", type: "address" }, { name: "value", type: "uint256" }], outputs: [{ type: "bool" }] },
-  { type: "function", name: "transfer", stateMutability: "nonpayable", inputs: [{ name: "to", type: "address" }, { name: "value", type: "uint256" }], outputs: [{ type: "bool" }] },
-  { type: "function", name: "transferFrom", stateMutability: "nonpayable", inputs: [{ name: "from", type: "address" }, { name: "to", type: "address" }, { name: "value", type: "uint256" }], outputs: [{ type: "bool" }] },
 ];
 
-/** BTD / BTB 片段（在 ERC20 基础上补充 rebase、年利率设置） */
+// ==== BTD / BTB 额外方法（rebase、年利率） ====
 const BTD_ABI = [
   ...ERC20_MIN_ABI,
   { type: "function", name: "rebase", stateMutability: "nonpayable", inputs: [], outputs: [] },
@@ -46,14 +47,14 @@ const BTB_ABI = [
   { type: "function", name: "setAnnualRateBP", stateMutability: "nonpayable", inputs: [{ name: "rateBP", type: "uint256" }], outputs: [] },
 ];
 
-/** Mint 合约片段（只包含本 DApp 会调用的方法） */
+// ==== Mint 片段（本 DApp 使用的入口） ====
 const MINT_ABI = [
   { type: "function", name: "mintBTD", stateMutability: "nonpayable", inputs: [{ name: "amount", type: "uint256" }], outputs: [] },
   { type: "function", name: "burnBTD", stateMutability: "nonpayable", inputs: [{ name: "amount", type: "uint256" }], outputs: [] },
   { type: "function", name: "burnBTB", stateMutability: "nonpayable", inputs: [{ name: "amount", type: "uint256" }], outputs: [] },
 ];
 
-/** Config 合约片段（价格、年利率） */
+// ==== Config 片段（价格、年利率） ====
 const CONFIG_ABI = [
   { type: "function", name: "btcPrice", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
   { type: "function", name: "btbPrice", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
@@ -63,12 +64,10 @@ const CONFIG_ABI = [
   { type: "function", name: "setAnnualRateBP", stateMutability: "nonpayable", inputs: [{ name: "rateBP", type: "uint256" }], outputs: [] },
 ];
 
-/** 工具：更稳健地获取注入的以太坊对象（支持多钱包聚合） */
+// ==== 工具 ====
 function getInjectedEthereum() {
-  const w = typeof window !== "undefined" ? window : undefined;
-  const eth = w?.ethereum;
+  const eth = typeof window !== "undefined" ? window.ethereum : undefined;
   if (!eth) return null;
-  // 一些浏览器/插件会把多个 provider 聚合在 window.ethereum.providers 中
   if (Array.isArray(eth.providers) && eth.providers.length > 0) {
     const mm = eth.providers.find((p) => p && p.isMetaMask);
     return mm || eth.providers[0];
@@ -76,10 +75,65 @@ function getInjectedEthereum() {
   return eth;
 }
 function inIframe() {
-  try { return window.self !== window.top; } catch (e) { return true; }
+  try { return typeof window !== "undefined" && window.self !== window.top; } catch (_) { return true; }
 }
 
-/** 连接以太坊 */
+// ==== UI 基础 ====
+function Section({ title, children }) {
+  return (
+    <div className="rounded-2xl shadow p-5 bg-white border border-gray-100">
+      <div className="text-xl font-semibold mb-4">{title}</div>
+      {children}
+    </div>
+  );
+}
+function Field({ label, children }) {
+  return (
+    <label className="block mb-3">
+      <div className="text-sm text-gray-600 mb-1">{label}</div>
+      {children}
+    </label>
+  );
+}
+function Input({ value, onChange, placeholder, type = "text" }) {
+  return (
+    <input
+      className="w-full rounded-xl border p-3 focus:outline-none focus:ring"
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      placeholder={placeholder}
+      type={type}
+    />
+  );
+}
+function Button({ onClick, children, disabled }) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className="px-4 py-2 rounded-xl shadow disabled:opacity-50 disabled:cursor-not-allowed bg-black text-white"
+    >
+      {children}
+    </button>
+  );
+}
+function Select({ options, value, onChange }) {
+  return (
+    <select
+      className="w-full rounded-xl border p-3 focus:outline-none focus:ring"
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+    >
+      {(options || []).map((op) => (
+        <option key={String(op.value ?? op)} value={op.value ?? op}>
+          {op.label ?? op}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+// ==== 连接 Hook ====
 function useEthers() {
   const [provider, setProvider] = useState(null);
   const [signer, setSigner] = useState(null);
@@ -91,12 +145,8 @@ function useEthers() {
     setLastError("");
     try {
       const injected = getInjectedEthereum();
-      if (!injected) {
-        throw new Error("未检测到钱包注入（window.ethereum 不可用）。请确认已安装 MetaMask，或在新窗口打开页面。");
-      }
-      // 使用 'any' 网络，避免切链导致的 provider 失效问题
-      const p = new ethers.BrowserProvider(injected, 'any');
-      // 触发授权请求
+      if (!injected) throw new Error("未检测到钱包注入（window.ethereum 不可用）。请确认已安装 MetaMask，或在新窗口打开页面。");
+      const p = new ethers.BrowserProvider(injected, "any");
       await p.send("eth_requestAccounts", []);
       const s = await p.getSigner();
       const net = await p.getNetwork();
@@ -106,14 +156,12 @@ function useEthers() {
       setChainId(Number(net.chainId));
       return true;
     } catch (e) {
-      // 标准化错误信息
-      const raw = e?.message || String(e);
+      const raw = e && e.message ? e.message : String(e);
       let msg = raw;
-      // 4001: 用户拒绝
       if (e && (e.code === 4001 || String(raw).includes("User rejected"))) {
         msg = "用户拒绝了连接请求。请在 MetaMask 中同意连接。";
       } else if (inIframe()) {
-        msg = `可能是 iframe 环境未注入钱包。请点击右上角“在新窗口打开”后重试。原始错误：${raw}`;
+        msg = `可能是 iframe 环境未注入钱包。请在新窗口打开后重试。原始错误：${raw}`;
       } else if (raw.toLowerCase().includes("metamask")) {
         msg = `连接 MetaMask 失败：${raw}`;
       }
@@ -125,21 +173,21 @@ function useEthers() {
   useEffect(() => {
     const injected = getInjectedEthereum();
     if (!injected) return;
-    const onChainChanged = () => window.location.reload();
-    const onAccountsChanged = (accs) => setAccount(accs?.[0] || "");
-    injected.on?.("chainChanged", onChainChanged);
-    injected.on?.("accountsChanged", onAccountsChanged);
+    const onChainChanged = () => (typeof window !== "undefined" ? window.location.reload() : undefined);
+    const onAccountsChanged = (accs) => setAccount((accs && accs[0]) || "");
+    injected.on && injected.on("chainChanged", onChainChanged);
+    injected.on && injected.on("accountsChanged", onAccountsChanged);
     return () => {
-      injected.removeListener?.("chainChanged", onChainChanged);
-      injected.removeListener?.("accountsChanged", onAccountsChanged);
+      injected.removeListener && injected.removeListener("chainChanged", onChainChanged);
+      injected.removeListener && injected.removeListener("accountsChanged", onAccountsChanged);
     };
   }, []);
 
   return { provider, signer, account, chainId, connect, lastError };
 }
 
-/*** 主组件 ***/
-function DApp() {
+// ==== 主组件 ====
+export default function DApp() {
   const { provider, signer, account, chainId, connect, lastError } = useEthers();
 
   // 地址
@@ -148,7 +196,7 @@ function DApp() {
   const [addrMint, setAddrMint] = useState(DEFAULT_ADDR.MINT);
   const [addrConfig, setAddrConfig] = useState(DEFAULT_ADDR.CONFIG);
 
-  // 构造合约实例（读/写分离）
+  // 合约实例（读/写分离）
   const cBTD = useMemo(() => (provider && addrBTD ? new ethers.Contract(addrBTD, BTD_ABI, provider) : null), [provider, addrBTD]);
   const cBTDWrite = useMemo(() => (signer && addrBTD ? new ethers.Contract(addrBTD, BTD_ABI, signer) : null), [signer, addrBTD]);
 
@@ -161,7 +209,7 @@ function DApp() {
   const cConfig = useMemo(() => (provider && addrConfig ? new ethers.Contract(addrConfig, CONFIG_ABI, provider) : null), [provider, addrConfig]);
   const cConfigWrite = useMemo(() => (signer && addrConfig ? new ethers.Contract(addrConfig, CONFIG_ABI, signer) : null), [signer, addrConfig]);
 
-  // 代币信息与余额
+  // 代币与余额
   const [decBTD, setDecBTD] = useState(18);
   const [decBTB, setDecBTB] = useState(18);
   const [balBTD, setBalBTD] = useState("-");
@@ -170,22 +218,25 @@ function DApp() {
   async function refreshBalances() {
     try {
       if (cBTD && account) {
-        const d = (await cBTD.decimals().catch(() => 18)) || 18;
-        setDecBTD(Number(d));
-        const raw = await cBTD.balanceOf(account);
-        setBalBTD(ethers.formatUnits(raw, Number(d)));
+        const d1 = (await cBTD.decimals().catch(() => 18)) || 18;
+        setDecBTD(Number(d1));
+        const raw1 = await cBTD.balanceOf(account);
+        setBalBTD(ethers.formatUnits(raw1, Number(d1)));
       }
       if (cBTB && account) {
-        const d = (await cBTB.decimals().catch(() => 18)) || 18;
-        setDecBTB(Number(d));
-        const raw = await cBTB.balanceOf(account);
-        setBalBTB(ethers.formatUnits(raw, Number(d)));
+        const d2 = (await cBTB.decimals().catch(() => 18)) || 18;
+        setDecBTB(Number(d2));
+        const raw2 = await cBTB.balanceOf(account);
+        setBalBTB(ethers.formatUnits(raw2, Number(d2)));
       }
-    } catch (e) { console.error(e); }
+    } catch (e) {
+      // 只记录错误，不中断 UI
+      console.error(e);
+    }
   }
   useEffect(() => { refreshBalances(); }, [cBTD, cBTB, account]);
 
-  // Config 只读数值
+  // Config 只读
   const [readBtcPrice, setReadBtcPrice] = useState("-");
   const [readBtbPrice, setReadBtbPrice] = useState("-");
   const [readAnnualBP, setReadAnnualBP] = useState("-");
@@ -204,18 +255,17 @@ function DApp() {
   }
   useEffect(() => { refreshConfigViews(); }, [cConfig]);
 
-  // 输入表单
+  // 表单
   const [amtBTD, setAmtBTD] = useState("0");
   const [amtBTBBurn, setAmtBTBBurn] = useState("0");
-
   const [setterName, setSetterName] = useState("setBtcPrice");
   const [setterValue, setSetterValue] = useState("0");
   const [priceDecimals, setPriceDecimals] = useState("8");
 
-  // 消息提示
+  // 消息
   const [msg, setMsg] = useState("");
 
-  // Approve 工具
+  // Approve
   async function approveToken(token, spender, amount, decimals) {
     try {
       if (!signer) return setMsg("请先连接钱包");
@@ -227,10 +277,10 @@ function DApp() {
       setMsg("发送交易：" + tx.hash);
       await tx.wait();
       setMsg("✅ Approve 成功");
-    } catch (e) { console.error(e); setMsg(e?.message || String(e)); }
+    } catch (e) { console.error(e); setMsg(e && e.message ? e.message : String(e)); }
   }
 
-  // 业务函数
+  // Mint/Burn/Rebase/Setter
   async function callMintBTD() {
     if (!signer) return setMsg("请先连接钱包");
     if (!cMintWrite) return setMsg("未就绪：Mint 合约");
@@ -244,9 +294,8 @@ function DApp() {
       await tx.wait();
       setMsg("✅ Mint 成功");
       refreshBalances();
-    } catch (e) { console.error(e); setMsg(e?.message || String(e)); }
+    } catch (e) { console.error(e); setMsg(e && e.message ? e.message : String(e)); }
   }
-
   async function callBurnBTD() {
     if (!signer) return setMsg("请先连接钱包");
     if (!cMintWrite) return setMsg("未就绪：Mint 合约");
@@ -260,9 +309,8 @@ function DApp() {
       await tx.wait();
       setMsg("✅ Burn BTD 成功");
       refreshBalances();
-    } catch (e) { console.error(e); setMsg(e?.message || String(e)); }
+    } catch (e) { console.error(e); setMsg(e && e.message ? e.message : String(e)); }
   }
-
   async function callBurnBTB() {
     if (!signer) return setMsg("请先连接钱包");
     if (!cMintWrite) return setMsg("未就绪：Mint 合约");
@@ -276,9 +324,8 @@ function DApp() {
       await tx.wait();
       setMsg("✅ Burn BTB 成功");
       refreshBalances();
-    } catch (e) { console.error(e); setMsg(e?.message || String(e)); }
+    } catch (e) { console.error(e); setMsg(e && e.message ? e.message : String(e)); }
   }
-
   async function callRebase(token) {
     try {
       if (!signer) return setMsg("请先连接钱包");
@@ -290,15 +337,14 @@ function DApp() {
       await tx.wait();
       setMsg(`✅ ${token} rebase 成功`);
       refreshBalances();
-    } catch (e) { console.error(e); setMsg(e?.message || String(e)); }
+    } catch (e) { console.error(e); setMsg(e && e.message ? e.message : String(e)); }
   }
-
   async function callSetter() {
     if (!signer) return setMsg("请先连接钱包");
     if (!cConfigWrite) return setMsg("未就绪：Config 合约");
     try {
       const dec = Number(priceDecimals || "8");
-      const val = setterValue.includes(".") ? ethers.parseUnits(setterValue, dec) : BigInt(setterValue);
+      const val = String(setterValue).includes(".") ? ethers.parseUnits(setterValue, dec) : BigInt(setterValue);
       const fn = cConfigWrite[setterName];
       if (!fn) return setMsg("Config 中未找到指定 setter：" + setterName);
       await fn.estimateGas(val);
@@ -307,63 +353,48 @@ function DApp() {
       await tx.wait();
       setMsg("✅ 设置成功");
       refreshConfigViews();
-    } catch (e) { console.error(e); setMsg(e?.message || String(e)); }
+    } catch (e) { console.error(e); setMsg(e && e.message ? e.message : String(e)); }
   }
 
-  // ===== 自检用例（测试区） =====
+  // ===== 自检用例（Sanity Tests） =====
   const [tests, setTests] = useState([]);
-  function addTest(name, pass, detail) {
-    setTests((prev) => [...prev, { name, pass, detail }]);
-  }
+  function addTest(name, pass, detail) { setTests((prev) => [...prev, { name, pass, detail }]); }
   async function runSelfTests() {
     setTests([]);
-    // 1. 地址格式（原有）
+    // 1. 地址格式
     addTest("地址格式：BTD", /^0x[0-9a-fA-F]{40}$/.test(addrBTD), addrBTD);
     addTest("地址格式：BTB", /^0x[0-9a-fA-F]{40}$/.test(addrBTB), addrBTB);
     addTest("地址格式：MINT", /^0x[0-9a-fA-F]{40}$/.test(addrMint), addrMint);
     addTest("地址格式：CONFIG", /^0x[0-9a-fA-F]{40}$/.test(addrConfig), addrConfig);
-    // 2. ABI 方法存在性（原有）
+    // 2. ABI 方法存在性
     addTest("BTD ABI 含 rebase", !!BTD_ABI.find((f) => f.name === "rebase"), "rebase in BTD_ABI");
     addTest("BTB ABI 含 rebase", !!BTB_ABI.find((f) => f.name === "rebase"), "rebase in BTB_ABI");
     addTest("MINT ABI 含 mintBTD", !!MINT_ABI.find((f) => f.name === "mintBTD"), "mintBTD in MINT_ABI");
     addTest("MINT ABI 含 burnBTD", !!MINT_ABI.find((f) => f.name === "burnBTD"), "burnBTD in MINT_ABI");
     addTest("MINT ABI 含 burnBTB", !!MINT_ABI.find((f) => f.name === "burnBTB"), "burnBTB in MINT_ABI");
     addTest("CONFIG ABI 含 setBtcPrice", !!CONFIG_ABI.find((f) => f.name === "setBtcPrice"), "setBtcPrice in CONFIG_ABI");
-    // 3. Provider 与账户（原有 + 新增）
+    // 3. Provider 与账户
     const injected = getInjectedEthereum();
     addTest("检测 Provider 注入", !!injected, injected ? "已注入" : "未注入");
-    addTest("Provider 是否 MetaMask", !!injected?.isMetaMask, String(!!injected?.isMetaMask));
+    addTest("Provider 是否 MetaMask", !!(injected && injected.isMetaMask), String(!!(injected && injected.isMetaMask)));
     addTest("当前是否 iframe", inIframe() === false, inIframe() ? "在 iframe 中" : "非 iframe");
     addTest("账户连接状态", !!account, account || "未连接");
-    // 4. 动态读链（原有）
+    // 4. 动态只读
     try {
-      if (cBTD) {
-        const d = await cBTD.decimals();
-        addTest("链上调用：BTD.decimals()", typeof Number(d) === "number", String(d));
-      }
-      if (cBTB) {
-        const d = await cBTB.decimals();
-        addTest("链上调用：BTB.decimals()", typeof Number(d) === "number", String(d));
-      }
-    } catch (e) {
-      addTest("链上读取（decimals）", false, e?.message || String(e));
-    }
+      if (cBTD) { const d = await cBTD.decimals(); addTest("链上调用：BTD.decimals()", typeof Number(d) === "number", String(d)); }
+      if (cBTB) { const d = await cBTB.decimals(); addTest("链上调用：BTB.decimals()", typeof Number(d) === "number", String(d)); }
+      if (cConfig) { const ann = await cConfig.annualRateBP(); addTest("链上调用：Config.annualRateBP()", ann !== undefined, String(ann)); }
+    } catch (e) { addTest("链上只读调用", false, e && e.message ? e.message : String(e)); }
   }
 
   const small = "text-sm text-gray-500";
 
   async function handleConnect() {
     setMsg("");
-    try {
-      await connect();
-      setMsg("✅ 钱包已连接");
-    } catch (e) {
-      setMsg(e?.message || String(e));
-    }
+    try { await connect(); setMsg("✅ 钱包已连接"); } catch (e) { setMsg(e && e.message ? e.message : String(e)); }
   }
-
   function openInNewWindow() {
-    try { window.open(window.location.href, "_blank"); } catch (e) {}
+    try { if (typeof window !== "undefined") window.open(window.location.href, "_blank"); } catch (_) {}
   }
 
   return (
@@ -372,18 +403,18 @@ function DApp() {
         <div className="flex items-center justify-between">
           <div>
             <div className="text-2xl font-bold">BRS 前端 DApp（BTD / BTB）</div>
-            <div className={small}>MetaMask 连接修复：多 provider 兼容 · 连接错误友好提示 · 自检扩展</div>
+            <div className={small}>React 组件版 · 读写分离 · estimateGas · 自检面板</div>
           </div>
           <div className="flex items-center gap-3 flex-wrap">
             <button onClick={openInNewWindow} className="text-xs underline text-gray-600">在新窗口打开</button>
             <div className="text-sm">{account ? `${account.slice(0,6)}...${account.slice(-4)}` : "未连接"}{chainId ? ` · chain ${chainId}` : ""}</div>
-            <button onClick={handleConnect} className="px-4 py-2 rounded-xl shadow bg-black text-white">{account ? "已连接" : "连接钱包"}</button>
+            <Button onClick={handleConnect}>{account ? "已连接" : "连接钱包"}</Button>
           </div>
         </div>
 
-        {(msg || lastError) ? (
+        {(msg || lastError) && (
           <div className="rounded-xl p-3 bg-yellow-50 border border-yellow-200 text-sm break-all">{msg || lastError}</div>
-        ) : null}
+        )}
 
         <Section title="合约配置（可按需修改）">
           <div className="grid md:grid-cols-2 gap-6">
@@ -412,8 +443,8 @@ function DApp() {
             </div>
           </div>
           <div className="mt-3 flex gap-3">
-            <button onClick={refreshBalances} className="px-4 py-2 rounded-xl shadow bg-black text-white">刷新余额</button>
-            <button onClick={refreshConfigViews} className="px-4 py-2 rounded-xl shadow bg-black text-white">刷新参数</button>
+            <Button onClick={refreshBalances}>刷新余额</Button>
+            <Button onClick={refreshConfigViews}>刷新参数</Button>
           </div>
         </Section>
 
@@ -422,21 +453,21 @@ function DApp() {
             <div className="space-y-3">
               <Field label={`BTD 数量（按 ${decBTD} 位小数）`}><Input value={amtBTD} onChange={setAmtBTD} placeholder="0.0" /></Field>
               <div className="flex gap-3 flex-wrap">
-                <button onClick={callMintBTD} className="px-4 py-2 rounded-xl shadow bg-black text-white">Mint BTD</button>
-                <button onClick={callBurnBTD} className="px-4 py-2 rounded-xl shadow bg-black text-white">Burn BTD</button>
-                <button onClick={() => callRebase("BTD")} disabled={!cBTD || !cBTD.rebase} className="px-4 py-2 rounded-xl shadow bg-black text-white disabled:opacity-50 disabled:cursor-not-allowed">BTD Rebase</button>
+                <Button onClick={callMintBTD}>Mint BTD</Button>
+                <Button onClick={callBurnBTD}>Burn BTD</Button>
+                <Button onClick={() => callRebase("BTD")} disabled={!cBTD || !cBTD.rebase}>BTD Rebase</Button>
               </div>
-              <div className={small}>提示：若 Burn 调用失败，可能需要先 Approve BTD 给 Mint 合约。</div>
+              <div className="text-sm text-gray-500">提示：若 Burn 调用失败，可能需要先 Approve BTD 给 Mint 合约。</div>
             </div>
             <div className="space-y-3">
               <Field label={`BTB Burn 数量（按 ${decBTB} 位小数）`}><Input value={amtBTBBurn} onChange={setAmtBTBBurn} placeholder="0.0" /></Field>
               <div className="flex gap-3 flex-wrap">
-                <button onClick={callBurnBTB} className="px-4 py-2 rounded-xl shadow bg-black text-white">Burn BTB</button>
-                <button onClick={() => callRebase("BTB")} disabled={!cBTB || !cBTB.rebase} className="px-4 py-2 rounded-xl shadow bg-black text-white disabled:opacity-50 disabled:cursor-not-allowed">BTB Rebase</button>
+                <Button onClick={callBurnBTB}>Burn BTB</Button>
+                <Button onClick={() => callRebase("BTB")} disabled={!cBTB || !cBTB.rebase}>BTB Rebase</Button>
               </div>
               <div className="flex gap-3 flex-wrap mt-3">
-                <button onClick={() => approveToken("BTD", addrMint, "MAX", decBTD)} className="px-4 py-2 rounded-xl shadow bg-black text-white">Approve BTD → Mint(MAX)</button>
-                <button onClick={() => approveToken("BTB", addrMint, "MAX", decBTB)} className="px-4 py-2 rounded-xl shadow bg-black text-white">Approve BTB → Mint(MAX)</button>
+                <Button onClick={() => approveToken("BTD", addrMint, "MAX", decBTD)}>Approve BTD → Mint(MAX)</Button>
+                <Button onClick={() => approveToken("BTB", addrMint, "MAX", decBTB)}>Approve BTB → Mint(MAX)</Button>
               </div>
             </div>
           </div>
@@ -446,23 +477,19 @@ function DApp() {
           <div className="grid md:grid-cols-2 gap-6">
             <div className="grid grid-cols-2 gap-3">
               <Field label="Setter">
-                <select className="w-full rounded-xl border p-3 focus:outline-none focus:ring" value={setterName} onChange={(e)=>setSetterName(e.target.value)}>
-                  <option value="setBtcPrice">setBtcPrice (BTC价)</option>
-                  <option value="setBtbPrice">setBtbPrice (BTB价)</option>
-                  <option value="setAnnualRateBP">setAnnualRateBP (年化BP)</option>
-                </select>
+                <Select value={setterName} onChange={setSetterName} options={[
+                  { value: "setBtcPrice", label: "setBtcPrice (BTC价)" },
+                  { value: "setBtbPrice", label: "setBtbPrice (BTB价)" },
+                  { value: "setAnnualRateBP", label: "setAnnualRateBP (年化BP)" },
+                ]} />
               </Field>
               <Field label={`输入值（解析为 ${priceDecimals} 位小数；纯整数视为原始值）`}>
                 <Input value={setterValue} onChange={setSetterValue} placeholder="例如：30000 或 30000.1234" />
               </Field>
               <Field label="小数位">
-                <select className="w-full rounded-xl border p-3 focus:outline-none focus:ring" value={priceDecimals} onChange={(e)=>setPriceDecimals(e.target.value)}>
-                  <option value="6">6</option>
-                  <option value="8">8</option>
-                  <option value="18">18</option>
-                </select>
+                <Select value={priceDecimals} onChange={setPriceDecimals} options={["6", "8", "18"]} />
               </Field>
-              <div className="flex items-end"><button onClick={callSetter} className="px-4 py-2 rounded-xl shadow bg-black text-white">调用 Setter</button></div>
+              <div className="flex items-end"><Button onClick={callSetter}>调用 Setter</Button></div>
             </div>
             <div className="rounded-xl p-4 bg-gray-50 border space-y-1 text-sm">
               <div className="font-semibold mb-1">读取（只读）</div>
@@ -474,9 +501,7 @@ function DApp() {
         </Section>
 
         <Section title="自检用例（Sanity Tests）">
-          <div className="flex gap-3 mb-3">
-            <button onClick={runSelfTests} className="px-4 py-2 rounded-xl shadow bg-black text-white">运行自检</button>
-          </div>
+          <div className="flex gap-3 mb-3"><Button onClick={runSelfTests}>运行自检</Button></div>
           <div className="space-y-2">
             {tests.length === 0 ? <div className={small}>点击“运行自检”开始</div> : null}
             {tests.map((t, i) => (
@@ -488,10 +513,8 @@ function DApp() {
           </div>
         </Section>
 
-        <div className="text-xs text-gray-500 pb-10">© {new Date().getFullYear()} BRS Demo UI — MetaMask 连接修复版</div>
+        <div className="text-xs text-gray-500 pb-10">© {new Date().getFullYear()} BRS Demo UI — React 组件版</div>
       </div>
     </div>
   );
 }
-
-export default DApp;
