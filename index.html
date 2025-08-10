@@ -2,19 +2,16 @@ import React, { useEffect, useMemo, useState } from "react";
 import { ethers } from "ethers";
 
 /**
- * BRS DApp — 单文件 React 组件（修复版）
- * 修复内容：
- *  - 彻底清理了不成对的大括号/try…catch 残片与插入文本，修复 SyntaxError: Unexpected token (258:4)
- *  - 所有写操作改为 signer 实例；读操作使用 provider 实例；发交易前先 estimateGas 暴露错误
- *  - 维持现有“自检用例”，并新增若干用例；保留 UI/功能不变
+ * BRS DApp — 单文件 React 组件（MetaMask 连接修复版）
  *
- * 功能：
- *  1) 连接钱包（MetaMask）
- *  2) Mint / Burn BTD；Burn BTB
- *  3) 对 BTD、BTB 执行 rebase（若 ABI 中存在）
- *  4) 设置 BTC 价格、BTB 价格、年化利率（Config 合约）
- *  5) Approve（将 BTD/BTB 授权给 Mint 合约）
- *  6) 内置“自检用例”，帮助定位配置/ABI 问题
+ * 修复点（针对 “Failed to connect to MetaMask” ）
+ *  - 更稳健的注入检测：支持 window.ethereum.providers，优先选择 isMetaMask 的 provider
+ *  - 统一在连接时 try/catch，并给出更友好的错误信息（用户拒绝/无注入/iframe 环境）
+ *  - 读写分离（provider / signer），所有写操作先 estimateGas，便于弹出签名框
+ *  - 提供“在新窗口打开”按钮以规避 iframe 阻止注入的问题
+ *  - 自检用例新增：注入检测、isMetaMask、iframe 检测
+ *
+ * 现有测试用例保持不变，并**新增**连接相关自检；如果你的预期行为不同，请在聊天里告诉我。
  */
 
 /** 默认合约地址（如与你的部署不一致，可在界面中修改） */
@@ -66,57 +63,20 @@ const CONFIG_ABI = [
   { type: "function", name: "setAnnualRateBP", stateMutability: "nonpayable", inputs: [{ name: "rateBP", type: "uint256" }], outputs: [] },
 ];
 
-/** UI 组件 */
-function Section(props) {
-  return (
-    <div className="rounded-2xl shadow p-5 bg-white border border-gray-100">
-      <div className="text-xl font-semibold mb-4">{props.title}</div>
-      {props.children}
-    </div>
-  );
+/** 工具：更稳健地获取注入的以太坊对象（支持多钱包聚合） */
+function getInjectedEthereum() {
+  const w = typeof window !== "undefined" ? window : undefined;
+  const eth = w?.ethereum;
+  if (!eth) return null;
+  // 一些浏览器/插件会把多个 provider 聚合在 window.ethereum.providers 中
+  if (Array.isArray(eth.providers) && eth.providers.length > 0) {
+    const mm = eth.providers.find((p) => p && p.isMetaMask);
+    return mm || eth.providers[0];
+  }
+  return eth;
 }
-function Field(props) {
-  return (
-    <label className="block mb-3">
-      <div className="text-sm text-gray-600 mb-1">{props.label}</div>
-      {props.children}
-    </label>
-  );
-}
-function Input(props) {
-  return (
-    <input
-      className="w-full rounded-xl border p-3 focus:outline-none focus:ring"
-      value={props.value}
-      onChange={(e) => props.onChange(e.target.value)}
-      placeholder={props.placeholder}
-      type={props.type || "text"}
-    />
-  );
-}
-function Button(props) {
-  return (
-    <button
-      onClick={props.onClick}
-      disabled={props.disabled}
-      className="px-4 py-2 rounded-xl shadow disabled:opacity-50 disabled:cursor-not-allowed bg-black text-white"
-    >
-      {props.children}
-    </button>
-  );
-}
-function Select(props) {
-  return (
-    <select
-      className="w-full rounded-xl border p-3 focus:outline-none focus:ring"
-      value={props.value}
-      onChange={(e) => props.onChange(e.target.value)}
-    >
-      {(props.options || []).map((op) => (
-        <option key={String(op.value ?? op)} value={op.value ?? op}>{op.label ?? op}</option>
-      ))}
-    </select>
-  );
+function inIframe() {
+  try { return window.self !== window.top; } catch (e) { return true; }
 }
 
 /** 连接以太坊 */
@@ -125,38 +85,62 @@ function useEthers() {
   const [signer, setSigner] = useState(null);
   const [account, setAccount] = useState("");
   const [chainId, setChainId] = useState(null);
+  const [lastError, setLastError] = useState("");
 
   async function connect() {
-    if (!(window && window.ethereum)) throw new Error("请安装 MetaMask");
-    const p = new ethers.BrowserProvider(window.ethereum);
-    await p.send("eth_requestAccounts", []);
-    const s = await p.getSigner();
-    const net = await p.getNetwork();
-    setProvider(p);
-    setSigner(s);
-    setAccount(await s.getAddress());
-    setChainId(Number(net.chainId));
+    setLastError("");
+    try {
+      const injected = getInjectedEthereum();
+      if (!injected) {
+        throw new Error("未检测到钱包注入（window.ethereum 不可用）。请确认已安装 MetaMask，或在新窗口打开页面。");
+      }
+      // 使用 'any' 网络，避免切链导致的 provider 失效问题
+      const p = new ethers.BrowserProvider(injected, 'any');
+      // 触发授权请求
+      await p.send("eth_requestAccounts", []);
+      const s = await p.getSigner();
+      const net = await p.getNetwork();
+      setProvider(p);
+      setSigner(s);
+      setAccount(await s.getAddress());
+      setChainId(Number(net.chainId));
+      return true;
+    } catch (e) {
+      // 标准化错误信息
+      const raw = e?.message || String(e);
+      let msg = raw;
+      // 4001: 用户拒绝
+      if (e && (e.code === 4001 || String(raw).includes("User rejected"))) {
+        msg = "用户拒绝了连接请求。请在 MetaMask 中同意连接。";
+      } else if (inIframe()) {
+        msg = `可能是 iframe 环境未注入钱包。请点击右上角“在新窗口打开”后重试。原始错误：${raw}`;
+      } else if (raw.toLowerCase().includes("metamask")) {
+        msg = `连接 MetaMask 失败：${raw}`;
+      }
+      setLastError(msg);
+      throw new Error(msg);
+    }
   }
 
   useEffect(() => {
-    const eth = window && window.ethereum;
-    if (!eth) return;
+    const injected = getInjectedEthereum();
+    if (!injected) return;
     const onChainChanged = () => window.location.reload();
-    const onAccountsChanged = (accs) => setAccount(accs[0] || "");
-    eth.on && eth.on("chainChanged", onChainChanged);
-    eth.on && eth.on("accountsChanged", onAccountsChanged);
+    const onAccountsChanged = (accs) => setAccount(accs?.[0] || "");
+    injected.on?.("chainChanged", onChainChanged);
+    injected.on?.("accountsChanged", onAccountsChanged);
     return () => {
-      eth.removeListener && eth.removeListener("chainChanged", onChainChanged);
-      eth.removeListener && eth.removeListener("accountsChanged", onAccountsChanged);
+      injected.removeListener?.("chainChanged", onChainChanged);
+      injected.removeListener?.("accountsChanged", onAccountsChanged);
     };
   }, []);
 
-  return { provider, signer, account, chainId, connect };
+  return { provider, signer, account, chainId, connect, lastError };
 }
 
 /*** 主组件 ***/
 function DApp() {
-  const { provider, signer, account, chainId, connect } = useEthers();
+  const { provider, signer, account, chainId, connect, lastError } = useEthers();
 
   // 地址
   const [addrBTD, setAddrBTD] = useState(DEFAULT_ADDR.BTD);
@@ -197,9 +181,7 @@ function DApp() {
         const raw = await cBTB.balanceOf(account);
         setBalBTB(ethers.formatUnits(raw, Number(d)));
       }
-    } catch (e) {
-      console.error(e);
-    }
+    } catch (e) { console.error(e); }
   }
   useEffect(() => { refreshBalances(); }, [cBTD, cBTB, account]);
 
@@ -335,22 +317,25 @@ function DApp() {
   }
   async function runSelfTests() {
     setTests([]);
-    // 1. 地址格式
+    // 1. 地址格式（原有）
     addTest("地址格式：BTD", /^0x[0-9a-fA-F]{40}$/.test(addrBTD), addrBTD);
     addTest("地址格式：BTB", /^0x[0-9a-fA-F]{40}$/.test(addrBTB), addrBTB);
     addTest("地址格式：MINT", /^0x[0-9a-fA-F]{40}$/.test(addrMint), addrMint);
     addTest("地址格式：CONFIG", /^0x[0-9a-fA-F]{40}$/.test(addrConfig), addrConfig);
-    // 2. ABI 方法存在性
+    // 2. ABI 方法存在性（原有）
     addTest("BTD ABI 含 rebase", !!BTD_ABI.find((f) => f.name === "rebase"), "rebase in BTD_ABI");
     addTest("BTB ABI 含 rebase", !!BTB_ABI.find((f) => f.name === "rebase"), "rebase in BTB_ABI");
     addTest("MINT ABI 含 mintBTD", !!MINT_ABI.find((f) => f.name === "mintBTD"), "mintBTD in MINT_ABI");
     addTest("MINT ABI 含 burnBTD", !!MINT_ABI.find((f) => f.name === "burnBTD"), "burnBTD in MINT_ABI");
     addTest("MINT ABI 含 burnBTB", !!MINT_ABI.find((f) => f.name === "burnBTB"), "burnBTB in MINT_ABI");
     addTest("CONFIG ABI 含 setBtcPrice", !!CONFIG_ABI.find((f) => f.name === "setBtcPrice"), "setBtcPrice in CONFIG_ABI");
-    // 3. Provider 与账户
-    addTest("检测 Provider", !!(window && window.ethereum), "window.ethereum 存在");
+    // 3. Provider 与账户（原有 + 新增）
+    const injected = getInjectedEthereum();
+    addTest("检测 Provider 注入", !!injected, injected ? "已注入" : "未注入");
+    addTest("Provider 是否 MetaMask", !!injected?.isMetaMask, String(!!injected?.isMetaMask));
+    addTest("当前是否 iframe", inIframe() === false, inIframe() ? "在 iframe 中" : "非 iframe");
     addTest("账户连接状态", !!account, account || "未连接");
-    // 4. 动态读链（可选）
+    // 4. 动态读链（原有）
     try {
       if (cBTD) {
         const d = await cBTD.decimals();
@@ -367,22 +352,37 @@ function DApp() {
 
   const small = "text-sm text-gray-500";
 
+  async function handleConnect() {
+    setMsg("");
+    try {
+      await connect();
+      setMsg("✅ 钱包已连接");
+    } catch (e) {
+      setMsg(e?.message || String(e));
+    }
+  }
+
+  function openInNewWindow() {
+    try { window.open(window.location.href, "_blank"); } catch (e) {}
+  }
+
   return (
     <div className="min-h-screen bg-gradient-to-b from-gray-50 to-gray-100">
       <div className="max-w-6xl mx-auto p-6 space-y-6">
         <div className="flex items-center justify-between">
           <div>
             <div className="text-2xl font-bold">BRS 前端 DApp（BTD / BTB）</div>
-            <div className={small}>修复版：单文件 · 读写分离 · 发交易前 estimateGas · 内置自检</div>
+            <div className={small}>MetaMask 连接修复：多 provider 兼容 · 连接错误友好提示 · 自检扩展</div>
           </div>
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-3 flex-wrap">
+            <button onClick={openInNewWindow} className="text-xs underline text-gray-600">在新窗口打开</button>
             <div className="text-sm">{account ? `${account.slice(0,6)}...${account.slice(-4)}` : "未连接"}{chainId ? ` · chain ${chainId}` : ""}</div>
-            <Button onClick={connect}>{account ? "已连接" : "连接钱包"}</Button>
+            <button onClick={handleConnect} className="px-4 py-2 rounded-xl shadow bg-black text-white">{account ? "已连接" : "连接钱包"}</button>
           </div>
         </div>
 
-        {msg ? (
-          <div className="rounded-xl p-3 bg-yellow-50 border border-yellow-200 text-sm break-all">{msg}</div>
+        {(msg || lastError) ? (
+          <div className="rounded-xl p-3 bg-yellow-50 border border-yellow-200 text-sm break-all">{msg || lastError}</div>
         ) : null}
 
         <Section title="合约配置（可按需修改）">
@@ -412,8 +412,8 @@ function DApp() {
             </div>
           </div>
           <div className="mt-3 flex gap-3">
-            <Button onClick={refreshBalances}>刷新余额</Button>
-            <Button onClick={refreshConfigViews}>刷新参数</Button>
+            <button onClick={refreshBalances} className="px-4 py-2 rounded-xl shadow bg-black text-white">刷新余额</button>
+            <button onClick={refreshConfigViews} className="px-4 py-2 rounded-xl shadow bg-black text-white">刷新参数</button>
           </div>
         </Section>
 
@@ -422,21 +422,21 @@ function DApp() {
             <div className="space-y-3">
               <Field label={`BTD 数量（按 ${decBTD} 位小数）`}><Input value={amtBTD} onChange={setAmtBTD} placeholder="0.0" /></Field>
               <div className="flex gap-3 flex-wrap">
-                <Button onClick={callMintBTD}>Mint BTD</Button>
-                <Button onClick={callBurnBTD}>Burn BTD</Button>
-                <Button onClick={() => callRebase("BTD")} disabled={!cBTD || !cBTD.rebase}>BTD Rebase</Button>
+                <button onClick={callMintBTD} className="px-4 py-2 rounded-xl shadow bg-black text-white">Mint BTD</button>
+                <button onClick={callBurnBTD} className="px-4 py-2 rounded-xl shadow bg-black text-white">Burn BTD</button>
+                <button onClick={() => callRebase("BTD")} disabled={!cBTD || !cBTD.rebase} className="px-4 py-2 rounded-xl shadow bg-black text-white disabled:opacity-50 disabled:cursor-not-allowed">BTD Rebase</button>
               </div>
               <div className={small}>提示：若 Burn 调用失败，可能需要先 Approve BTD 给 Mint 合约。</div>
             </div>
             <div className="space-y-3">
               <Field label={`BTB Burn 数量（按 ${decBTB} 位小数）`}><Input value={amtBTBBurn} onChange={setAmtBTBBurn} placeholder="0.0" /></Field>
               <div className="flex gap-3 flex-wrap">
-                <Button onClick={callBurnBTB}>Burn BTB</Button>
-                <Button onClick={() => callRebase("BTB")} disabled={!cBTB || !cBTB.rebase}>BTB Rebase</Button>
+                <button onClick={callBurnBTB} className="px-4 py-2 rounded-xl shadow bg-black text-white">Burn BTB</button>
+                <button onClick={() => callRebase("BTB")} disabled={!cBTB || !cBTB.rebase} className="px-4 py-2 rounded-xl shadow bg-black text-white disabled:opacity-50 disabled:cursor-not-allowed">BTB Rebase</button>
               </div>
               <div className="flex gap-3 flex-wrap mt-3">
-                <Button onClick={() => approveToken("BTD", addrMint, "MAX", decBTD)}>Approve BTD → Mint(MAX)</Button>
-                <Button onClick={() => approveToken("BTB", addrMint, "MAX", decBTB)}>Approve BTB → Mint(MAX)</Button>
+                <button onClick={() => approveToken("BTD", addrMint, "MAX", decBTD)} className="px-4 py-2 rounded-xl shadow bg-black text-white">Approve BTD → Mint(MAX)</button>
+                <button onClick={() => approveToken("BTB", addrMint, "MAX", decBTB)} className="px-4 py-2 rounded-xl shadow bg-black text-white">Approve BTB → Mint(MAX)</button>
               </div>
             </div>
           </div>
@@ -446,19 +446,23 @@ function DApp() {
           <div className="grid md:grid-cols-2 gap-6">
             <div className="grid grid-cols-2 gap-3">
               <Field label="Setter">
-                <Select value={setterName} onChange={setSetterName} options={[
-                  { value: "setBtcPrice", label: "setBtcPrice (BTC价)" },
-                  { value: "setBtbPrice", label: "setBtbPrice (BTB价)" },
-                  { value: "setAnnualRateBP", label: "setAnnualRateBP (年化BP)" },
-                ]} />
+                <select className="w-full rounded-xl border p-3 focus:outline-none focus:ring" value={setterName} onChange={(e)=>setSetterName(e.target.value)}>
+                  <option value="setBtcPrice">setBtcPrice (BTC价)</option>
+                  <option value="setBtbPrice">setBtbPrice (BTB价)</option>
+                  <option value="setAnnualRateBP">setAnnualRateBP (年化BP)</option>
+                </select>
               </Field>
               <Field label={`输入值（解析为 ${priceDecimals} 位小数；纯整数视为原始值）`}>
                 <Input value={setterValue} onChange={setSetterValue} placeholder="例如：30000 或 30000.1234" />
               </Field>
               <Field label="小数位">
-                <Select value={priceDecimals} onChange={setPriceDecimals} options={["6","8","18"]} />
+                <select className="w-full rounded-xl border p-3 focus:outline-none focus:ring" value={priceDecimals} onChange={(e)=>setPriceDecimals(e.target.value)}>
+                  <option value="6">6</option>
+                  <option value="8">8</option>
+                  <option value="18">18</option>
+                </select>
               </Field>
-              <div className="flex items-end"><Button onClick={callSetter}>调用 Setter</Button></div>
+              <div className="flex items-end"><button onClick={callSetter} className="px-4 py-2 rounded-xl shadow bg-black text-white">调用 Setter</button></div>
             </div>
             <div className="rounded-xl p-4 bg-gray-50 border space-y-1 text-sm">
               <div className="font-semibold mb-1">读取（只读）</div>
@@ -470,7 +474,9 @@ function DApp() {
         </Section>
 
         <Section title="自检用例（Sanity Tests）">
-          <div className="flex gap-3 mb-3"><Button onClick={runSelfTests}>运行自检</Button></div>
+          <div className="flex gap-3 mb-3">
+            <button onClick={runSelfTests} className="px-4 py-2 rounded-xl shadow bg-black text-white">运行自检</button>
+          </div>
           <div className="space-y-2">
             {tests.length === 0 ? <div className={small}>点击“运行自检”开始</div> : null}
             {tests.map((t, i) => (
@@ -482,7 +488,7 @@ function DApp() {
           </div>
         </Section>
 
-        <div className="text-xs text-gray-500 pb-10">© {new Date().getFullYear()} BRS Demo UI — 修复版</div>
+        <div className="text-xs text-gray-500 pb-10">© {new Date().getFullYear()} BRS Demo UI — MetaMask 连接修复版</div>
       </div>
     </div>
   );
